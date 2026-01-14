@@ -9,39 +9,84 @@
 #include <sys/socket.h>
 #include <errno.h>
 
-/* ================= 寄存器定义 ================= */
+/* ================= 基本配置 ================= */
 
-#define REG_BASE_ADDR        0x40000000
-#define REG_MAP_SIZE         0x1000
+#define NUM_CHANNELS      5
+#define FRAME_HEAD_LEN    4
 
-#define REG_DDR_ADDR_OFF     0x00
-#define REG_DDR_SIZE_OFF     0x04
-#define REG_TRIG_OFF         0x08
+#define REG_BASE_ADDR     0x40000000
+#define REG_MAP_SIZE      0x1000
 
-/* ================= 安全限制 ================= */
+#define DDR_MAX_SIZE      (2 * 1024 * 1024)
 
-#define DDR_MAX_SIZE         (2 * 1024 * 1024)
+#define DEST_IP           "192.168.3.121"
+#define DEST_PORT         9875
+#define TCP_PKT_SIZE      1024
 
-/* ================= TCP 配置 ================= */
+/* trig 事件 FIFO 深度 */
+#define TRIG_QUEUE_SIZE  32
 
-#define DEST_IP              "192.168.3.121"
-#define DEST_PORT            9875
-#define TCP_PKT_SIZE         1024
+/* ================= 通道配置结构 ================= */
 
-/* ================================================= */
+typedef struct {
+    uint8_t  frame_head[FRAME_HEAD_LEN]; /* 当前不使用，仅保留 */
+    uint32_t tx_addr_off;
+    uint32_t tx_len_off;
+    uint32_t tx_trig_off;
+} tx_channel_cfg_t;
+
+/* ================= 5 路通道配置 ================= */
+
+static tx_channel_cfg_t g_tx_cfg[NUM_CHANNELS] = {
+    { {0xFA, 0xFA, 0x00, 0x01},  0x3C,  0x40,  0x44 },  /* CH0 */
+    { {0xFA, 0xFA, 0x00, 0x02},  0x48,  0x4C,  0x50 },  /* CH1 */
+    { {0xFA, 0xFA, 0x00, 0x03},  0x54,  0x58,  0x5C },  /* CH2 */
+    { {0xFA, 0xFA, 0x00, 0x04},  0x60,  0x64,  0x68 },  /* CH3 */
+    { {0xFA, 0xFA, 0x00, 0x05},  0x6C,  0x70,  0x74 },  /* CH4 */
+};
+
+/* ================= trig FIFO ================= */
+
+typedef struct {
+    int ch[TRIG_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+} trig_queue_t;
+
+static trig_queue_t g_trig_q;
+
+static int trig_queue_push(trig_queue_t *q, int ch)
+{
+    if (q->count >= TRIG_QUEUE_SIZE)
+        return -1;
+
+    q->ch[q->tail] = ch;
+    q->tail = (q->tail + 1) % TRIG_QUEUE_SIZE;
+    q->count++;
+    return 0;
+}
+
+static int trig_queue_pop(trig_queue_t *q, int *ch)
+{
+    if (q->count == 0)
+        return -1;
+
+    *ch = q->ch[q->head];
+    q->head = (q->head + 1) % TRIG_QUEUE_SIZE;
+    q->count--;
+    return 0;
+}
+
+/* ================= TCP 发送 ================= */
 
 static int tcp_send_all(int sockfd, const uint8_t *buf, size_t len)
 {
     size_t sent = 0;
-
     while (sent < len) {
         ssize_t ret = send(sockfd, buf + sent, len - sent, 0);
-        if (ret < 0) {
-            perror("[ERROR] send");
-            return -1;
-        }
-        if (ret == 0) {
-            printf("[ERROR] send returned 0 (peer closed)\n");
+        if (ret <= 0) {
+            perror("send");
             return -1;
         }
         sent += ret;
@@ -49,21 +94,16 @@ static int tcp_send_all(int sockfd, const uint8_t *buf, size_t len)
     return 0;
 }
 
+/* ================= 主程序 ================= */
+
 int main(void)
 {
-    int mem_fd  = -1;
-    int sockfd  = -1;
-
+    int mem_fd = -1;
+    int sockfd = -1;
     void *reg_map = NULL;
-    void *ddr_map = NULL;
 
-    volatile uint32_t *reg_ddr_addr;
-    volatile uint32_t *reg_ddr_size;
-    volatile uint32_t *reg_trig;
-
-    uint8_t  *ddr_ptr = NULL;
-    uint32_t last_trig = 0;
-    uint32_t last_ddr_size = 0;
+    uint32_t last_trig[NUM_CHANNELS] = {0};
+    int sending = 0;
 
     struct sockaddr_in dest_addr;
 
@@ -75,22 +115,15 @@ int main(void)
     }
 
     /* 映射寄存器 */
-    reg_map = mmap(NULL,
-                   REG_MAP_SIZE,
-                   PROT_READ,
-                   MAP_SHARED,
-                   mem_fd,
-                   REG_BASE_ADDR);
+    reg_map = mmap(NULL, REG_MAP_SIZE,
+                   PROT_READ, MAP_SHARED,
+                   mem_fd, REG_BASE_ADDR);
     if (reg_map == MAP_FAILED) {
         perror("mmap reg");
         goto cleanup;
     }
 
-    reg_ddr_addr = (volatile uint32_t *)((uint8_t *)reg_map + REG_DDR_ADDR_OFF);
-    reg_ddr_size = (volatile uint32_t *)((uint8_t *)reg_map + REG_DDR_SIZE_OFF);
-    reg_trig     = (volatile uint32_t *)((uint8_t *)reg_map + REG_TRIG_OFF);
-
-    /* 创建 TCP socket */
+    /* TCP socket */
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
         perror("socket");
@@ -102,110 +135,103 @@ int main(void)
     dest_addr.sin_port   = htons(DEST_PORT);
     inet_pton(AF_INET, DEST_IP, &dest_addr.sin_addr);
 
-    printf("========================================\n");
-    printf(" UART2ETH DDR -> TCP Sender Started\n");
-    printf(" REG_BASE     : 0x%08X\n", REG_BASE_ADDR);
-    printf(" TRIG_REG     : 0x%08X\n", REG_BASE_ADDR + REG_TRIG_OFF);
-    printf(" DEST         : %s:%d\n", DEST_IP, DEST_PORT);
-    printf("========================================\n");
-
-    printf("[INFO] Connecting to TCP server...\n");
     if (connect(sockfd,
                 (struct sockaddr *)&dest_addr,
                 sizeof(dest_addr)) < 0) {
         perror("connect");
         goto cleanup;
     }
-    printf("[INFO] TCP connected OK\n");
-    printf("[INFO] Waiting for trigger...\n");
+
+    printf("[INFO] UART2ETH TX 5CH FIFO sender started\n");
 
     /* ================= 主循环 ================= */
 
     while (1) {
 
-        uint32_t cur_trig = *reg_trig;
+        /* ---------- A. trig 检测（不阻塞） ---------- */
+        for (int ch = 0; ch < NUM_CHANNELS; ch++) {
 
-        /* 0 -> 1 上升沿触发 */
-        if (last_trig == 0 && cur_trig == 1) {
+            volatile uint32_t *reg_trig =
+                (volatile uint32_t *)((uint8_t *)reg_map +
+                                       g_tx_cfg[ch].tx_trig_off);
 
-            uint32_t ddr_phys_addr  = *reg_ddr_addr;
-            uint32_t ddr_total_size = *reg_ddr_size;
+            uint32_t cur = *reg_trig;
 
-            printf("[TRIGGER] addr=0x%08X size=%u\n",
-                   ddr_phys_addr, ddr_total_size);
-
-            if (ddr_phys_addr == 0 ||
-                ddr_total_size == 0 ||
-                ddr_total_size > DDR_MAX_SIZE ||
-                (ddr_phys_addr & 0xFFF)) {
-
-                printf("[WARN] Invalid DDR params, ignore trigger\n");
-                last_trig = cur_trig;
-                usleep(1000);
-                continue;
+            if (last_trig[ch] == 0 && cur == 1) {
+                trig_queue_push(&g_trig_q, ch);
+                printf("[EVENT] CH%d trig queued\n", ch);
             }
 
-            if (ddr_map && ddr_map != MAP_FAILED) {
-                munmap(ddr_map, last_ddr_size);
-                ddr_map = NULL;
-                ddr_ptr = NULL;
-            }
-
-            ddr_map = mmap(NULL,
-                           ddr_total_size,
-                           PROT_READ,
-                           MAP_SHARED,
-                           mem_fd,
-                           ddr_phys_addr);
-            if (ddr_map == MAP_FAILED) {
-                perror("mmap ddr");
-                last_trig = cur_trig;
-                usleep(1000);
-                continue;
-            }
-
-            ddr_ptr = (uint8_t *)ddr_map;
-            last_ddr_size = ddr_total_size;
-
-            printf("[SEND] TCP sending %u bytes...\n", ddr_total_size);
-
-            size_t offset = 0;
-            unsigned int pkt_cnt = 0;
-
-            while (offset < ddr_total_size) {
-
-                size_t send_len = TCP_PKT_SIZE;
-                if (offset + send_len > ddr_total_size)
-                    send_len = ddr_total_size - offset;
-
-                if (tcp_send_all(sockfd,
-                                 ddr_ptr + offset,
-                                 send_len) < 0) {
-                    printf("[ERROR] TCP send failed\n");
-                    break;
-                }
-
-                offset += send_len;
-                pkt_cnt++;
-            }
-
-            printf("[DONE] packets=%u total_bytes=%zu\n",
-                   pkt_cnt, offset);
+            last_trig[ch] = cur;
         }
 
-        last_trig = cur_trig;
+        /* ---------- B. 若空闲则发送一个 ---------- */
+        if (!sending && g_trig_q.count > 0) {
+
+            int ch;
+            if (trig_queue_pop(&g_trig_q, &ch) == 0) {
+
+                tx_channel_cfg_t *cfg = &g_tx_cfg[ch];
+
+                volatile uint32_t *reg_addr =
+                    (volatile uint32_t *)((uint8_t *)reg_map + cfg->tx_addr_off);
+                volatile uint32_t *reg_len  =
+                    (volatile uint32_t *)((uint8_t *)reg_map + cfg->tx_len_off);
+
+                uint32_t ddr_addr = *reg_addr;
+                uint32_t ddr_len  = *reg_len;
+
+                if (ddr_addr == 0 ||
+                    ddr_len == 0 ||
+                    ddr_len > DDR_MAX_SIZE ||
+                    (ddr_addr & 0xFFF)) {
+                    printf("[CH%d] invalid DDR params\n", ch);
+                    continue;
+                }
+
+                sending = 1;
+
+                void *ddr_map = mmap(NULL, ddr_len,
+                                     PROT_READ, MAP_SHARED,
+                                     mem_fd, ddr_addr);
+                if (ddr_map == MAP_FAILED) {
+                    perror("mmap ddr");
+                    sending = 0;
+                    continue;
+                }
+
+                uint8_t *ddr_ptr = (uint8_t *)ddr_map;
+                size_t offset = 0;
+
+                while (offset < ddr_len) {
+                    size_t len = TCP_PKT_SIZE;
+                    if (offset + len > ddr_len)
+                        len = ddr_len - offset;
+
+                    if (tcp_send_all(sockfd,
+                                     ddr_ptr + offset,
+                                     len) < 0)
+                        break;
+
+                    offset += len;
+                }
+
+                printf("[CH%d] SEND DONE (%zu bytes)\n", ch, offset);
+
+                munmap(ddr_map, ddr_len);
+                sending = 0;
+            }
+        }
+
         usleep(1000);
     }
 
 cleanup:
-    if (ddr_map && ddr_map != MAP_FAILED)
-        munmap(ddr_map, last_ddr_size);
     if (reg_map && reg_map != MAP_FAILED)
         munmap(reg_map, REG_MAP_SIZE);
     if (sockfd >= 0)
         close(sockfd);
     if (mem_fd >= 0)
         close(mem_fd);
-
     return 0;
 }

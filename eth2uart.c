@@ -7,24 +7,38 @@
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <errno.h>
 
 /* ================= TCP 配置 ================= */
 
 #define TCP_LISTEN_PORT   9876
-#define TCP_RECV_SIZE    4096    /* 网络接收块大小 */
-
-/* ================= 帧头 ================= */
-
-static const uint8_t FRAME_HEAD[4] = {0xFA, 0xFA, 0x00, 0x01};
+#define TCP_RECV_SIZE     4096    /* 网络接收块大小 */
 
 /* ================= FPGA 寄存器 ================= */
 
-#define REG_BASE_ADDR    0x40000000
-#define REG_MAP_SIZE     0x1000
+#define REG_BASE_ADDR     0x40000000
+#define REG_MAP_SIZE      0x1000
 
-#define RX_ADDR_OFF      0x0C
-#define RX_LEN_OFF       0x10
-#define RX_TRIG_OFF      0x14
+/* ================= 多路配置 ================= */
+
+#define NUM_CHANNELS      5
+
+typedef struct {
+    uint8_t  frame_head[4];   /* 该通道的帧头 */
+    uint32_t rx_addr_off;     /* RX_ADDR 寄存器偏移 */
+    uint32_t rx_len_off;      /* RX_LEN  寄存器偏移 */
+    uint32_t rx_trig_off;     /* RX_TRIG 寄存器偏移 */
+} rx_channel_cfg_t;
+
+/* TODO: 按你的实际协议/寄存器映射修改这里 */
+static rx_channel_cfg_t g_rx_cfg[NUM_CHANNELS] = {
+    /*   frame_head                addr   len    trig */
+    { {0xFA, 0xFA, 0x00, 0x01},  0x00,  0x04,  0x08 },  /* CH0 */
+    { {0xFA, 0xFA, 0x00, 0x02},  0x0C,  0x10,  0x14 },  /* CH1 */
+    { {0xFA, 0xFA, 0x00, 0x03},  0x18,  0x1C,  0x20 },  /* CH2 */
+    { {0xFA, 0xFA, 0x00, 0x04},  0x24,  0x28,  0x2C },  /* CH3 */
+    { {0xFA, 0xFA, 0x00, 0x05},  0x30,  0x34,  0x38 },  /* CH4 */
+};
 
 /* ================================================= */
 
@@ -33,11 +47,31 @@ static int recv_all(int fd, uint8_t *buf, size_t len)
     size_t got = 0;
     while (got < len) {
         ssize_t ret = recv(fd, buf + got, len - got, 0);
-        if (ret <= 0)
+        if (ret == 0) return -1;           /* peer closed */
+        if (ret < 0) {
+            if (errno == EINTR) continue;
             return -1;
-        got += ret;
+        }
+        got += (size_t)ret;
     }
     return 0;
+}
+
+static int find_channel_by_head(const uint8_t *hdr4)
+{
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        if (memcmp(hdr4, g_rx_cfg[i].frame_head, 4) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static uint32_t be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] <<  8) |
+           ((uint32_t)p[3] <<  0);
 }
 
 int main(void)
@@ -49,15 +83,12 @@ int main(void)
     struct sockaddr_in local_addr;
     socklen_t addr_len = sizeof(local_addr);
 
-    /* FPGA 寄存器 */
+    /* FPGA 寄存器映射 */
     void *reg_map = NULL;
-    volatile uint32_t *reg_rx_addr;
-    volatile uint32_t *reg_rx_len;
-    volatile uint32_t *reg_rx_trig;
 
-    /* DDR */
-    void *ddr_map = NULL;
-    uint8_t *ddr_ptr;
+    /* DDR 映射 */
+    void   *ddr_map = NULL;
+    size_t  ddr_map_len = 0;
 
     /* 网络缓冲 */
     uint8_t hdr[12];
@@ -79,12 +110,9 @@ int main(void)
                    REG_BASE_ADDR);
     if (reg_map == MAP_FAILED) {
         perror("mmap reg");
+        reg_map = NULL;
         goto cleanup;
     }
-
-    reg_rx_addr = (volatile uint32_t *)((uint8_t *)reg_map + RX_ADDR_OFF);
-    reg_rx_len  = (volatile uint32_t *)((uint8_t *)reg_map + RX_LEN_OFF);
-    reg_rx_trig = (volatile uint32_t *)((uint8_t *)reg_map + RX_TRIG_OFF);
 
     /* ================= TCP Server ================= */
 
@@ -93,6 +121,9 @@ int main(void)
         perror("socket");
         goto cleanup;
     }
+
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     memset(&local_addr, 0, sizeof(local_addr));
     local_addr.sin_family = AF_INET;
@@ -112,8 +143,9 @@ int main(void)
     }
 
     printf("========================================\n");
-    printf(" TCP → DDR → FPGA (Streaming)\n");
+    printf(" TCP → DDR → FPGA (5-Channel, Configurable)\n");
     printf(" Port : %d\n", TCP_LISTEN_PORT);
+    printf(" Channels: %d\n", NUM_CHANNELS);
     printf("========================================\n");
     printf("[INFO] Waiting for TCP connection...\n");
 
@@ -137,63 +169,81 @@ int main(void)
             break;
         }
 
-        if (memcmp(hdr, FRAME_HEAD, 4) != 0) {
-            printf("[ERROR] Invalid frame head\n");
+        int ch = find_channel_by_head(hdr);
+        if (ch < 0) {
+            printf("[ERROR] Unknown frame head: %02X %02X %02X %02X\n",
+                   hdr[0], hdr[1], hdr[2], hdr[3]);
             break;
         }
 
-        uint32_t len =
-            (hdr[4] << 24) | (hdr[5] << 16) |
-            (hdr[6] << 8)  |  hdr[7];
+        rx_channel_cfg_t *cfg = &g_rx_cfg[ch];
 
-        uint32_t addr =
-            (hdr[8] << 24) | (hdr[9] << 16) |
-            (hdr[10] << 8) |  hdr[11];
+        uint32_t len  = be32(&hdr[4]);
+        uint32_t addr = be32(&hdr[8]);
 
-        printf("[FRAME] len=%u (%.2f MB), addr=0x%08X\n",
-               len, len / 1024.0 / 1024.0, addr);
+        printf("[FRAME][CH%d] len=%u (%.2f MB), addr=0x%08X\n",
+               ch, len, len / 1024.0 / 1024.0, addr);
+
+        if (len == 0) {
+            printf("[ERROR] len=0\n");
+            break;
+        }
 
         /* ---------- 2. mmap DDR ---------- */
+        ddr_map_len = (size_t)len;
         ddr_map = mmap(NULL,
-                       len,
+                       ddr_map_len,
                        PROT_READ | PROT_WRITE,
                        MAP_SHARED,
                        mem_fd,
-                       addr);
+                       (off_t)addr);
         if (ddr_map == MAP_FAILED) {
             perror("mmap ddr");
+            ddr_map = NULL;
+            ddr_map_len = 0;
             break;
         }
 
-        ddr_ptr = (uint8_t *)ddr_map;
+        uint8_t *ddr_ptr = (uint8_t *)ddr_map;
 
         /* ---------- 3. 流式接收 payload 并写 DDR ---------- */
         uint32_t left = len;
         uint32_t written = 0;
 
         while (left > 0) {
-            ssize_t n = recv(conn_fd,
-                             net_buf,
-                             left > TCP_RECV_SIZE ?
-                             TCP_RECV_SIZE : left,
-                             0);
-            if (n <= 0) {
+            size_t to_read = (left > TCP_RECV_SIZE) ? TCP_RECV_SIZE : left;
+
+            ssize_t n = recv(conn_fd, net_buf, to_read, 0);
+            if (n == 0) {
                 printf("[ERROR] TCP closed during payload\n");
                 goto cleanup;
             }
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                perror("recv payload");
+                goto cleanup;
+            }
 
-            memcpy(ddr_ptr, net_buf, n);
-            ddr_ptr += n;
-            left    -= n;
-            written += n;
+            memcpy(ddr_ptr, net_buf, (size_t)n);
+            ddr_ptr += (size_t)n;
+            left    -= (uint32_t)n;
+            written += (uint32_t)n;
         }
 
-        munmap(ddr_map, len);
+        munmap(ddr_map, ddr_map_len);
         ddr_map = NULL;
+        ddr_map_len = 0;
 
-        printf("[DDR] write done: %u bytes\n", written);
+        printf("[DDR][CH%d] write done: %u bytes\n", ch, written);
 
         /* ---------- 4. 完整帧完成后再通知 FPGA ---------- */
+        volatile uint32_t *reg_rx_addr =
+            (volatile uint32_t *)((uint8_t *)reg_map + cfg->rx_addr_off);
+        volatile uint32_t *reg_rx_len  =
+            (volatile uint32_t *)((uint8_t *)reg_map + cfg->rx_len_off);
+        volatile uint32_t *reg_rx_trig =
+            (volatile uint32_t *)((uint8_t *)reg_map + cfg->rx_trig_off);
+
         *reg_rx_len  = len;
         *reg_rx_addr = addr;
 
@@ -201,19 +251,24 @@ int main(void)
         usleep(1);
         *reg_rx_trig = 1;
 
-        printf("[FPGA] TRIG=1 LEN=0x%08X ADDR=0x%08X\n",
-               len, addr);
+        printf("[FPGA][CH%d] TRIG=1 LEN=0x%08X ADDR=0x%08X (off: addr=0x%X len=0x%X trig=0x%X)\n",
+               ch, len, addr,
+               cfg->rx_addr_off, cfg->rx_len_off, cfg->rx_trig_off);
     }
 
 cleanup:
-    if (ddr_map && ddr_map != MAP_FAILED)
-        munmap(ddr_map, 0);
-    if (reg_map && reg_map != MAP_FAILED)
+    if (ddr_map)
+        munmap(ddr_map, ddr_map_len);
+
+    if (reg_map)
         munmap(reg_map, REG_MAP_SIZE);
+
     if (conn_fd >= 0)
         close(conn_fd);
+
     if (listen_fd >= 0)
         close(listen_fd);
+
     if (mem_fd >= 0)
         close(mem_fd);
 
