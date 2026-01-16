@@ -1,0 +1,70 @@
+#!/bin/sh
+
+BASE_ADDR=0x40000080
+MAX_LED=20
+
+usage() {
+    echo "用法:"
+    echo "  led on  <n> [n2 ...]   # 打开指定 LED"
+    echo "  led off <n> [n2 ...]  # 关闭指定 LED"
+    echo "  led all               # 全亮"
+    echo "  led none              # 全灭"
+    exit 1
+}
+
+# ---------- 参数数量检查 ----------
+[ $# -lt 1 ] && usage
+
+CMD=$1
+shift
+
+# ---------- 全亮 ----------
+if [ "$CMD" = "all" ]; then
+    devmem $BASE_ADDR 32 $(( (1 << MAX_LED) - 1 ))
+    exit 0
+fi
+
+# ---------- 全灭 ----------
+if [ "$CMD" = "none" ]; then
+    devmem $BASE_ADDR 32 0
+    exit 0
+fi
+
+# ---------- on / off ----------
+if [ "$CMD" != "on" ] && [ "$CMD" != "off" ]; then
+    usage
+fi
+
+[ $# -lt 1 ] && usage
+
+# ---------- 读当前值 ----------
+CUR=$(devmem $BASE_ADDR 32)
+CUR=$((CUR))
+
+MASK=0
+
+for LED in "$@"; do
+    case "$LED" in
+        *[!0-9]*)
+            echo "非法参数: $LED"
+            exit 1
+            ;;
+    esac
+
+    if [ "$LED" -lt 1 ] || [ "$LED" -gt "$MAX_LED" ]; then
+        echo "LED 编号超范围: $LED (1~$MAX_LED)"
+        exit 1
+    fi
+
+    MASK=$((MASK | (1 << (LED - 1))))
+done
+
+# ---------- 修改位 ----------
+if [ "$CMD" = "on" ]; then
+    NEW=$((CUR | MASK))
+else
+    NEW=$((CUR & ~MASK))
+fi
+
+# ---------- 写回 ----------
+devmem $BASE_ADDR 32 $NEW
