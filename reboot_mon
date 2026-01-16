@@ -1,0 +1,34 @@
+#!/bin/sh
+
+DAEMON=/usr/uart_eth/reboot_mon.sh
+PIDFILE=/var/run/reboot_mon.pid
+
+case "$1" in
+    start)
+        echo "Starting reboot monitor..."
+        if [ -f $PIDFILE ]; then
+            echo "reboot_mon already running"
+            exit 0
+        fi
+        $DAEMON &
+        echo $! > $PIDFILE
+        ;;
+    stop)
+        echo "Stopping reboot monitor..."
+        if [ -f $PIDFILE ]; then
+            kill "$(cat $PIDFILE)" 2>/dev/null
+            rm -f $PIDFILE
+        fi
+        ;;
+    restart)
+        $0 stop
+        sleep 1
+        $0 start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0
